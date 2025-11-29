@@ -1,10 +1,11 @@
 """
 Convert an image to ZX Spectrum resolution (256x192) and color palette (8 colors with 2 brightness levels, minus black which is the same at both) at 32 x 24.
+Supports either perceptual (CIEDE2000 in Lab) or simple RGB distance per image.
 """
 
 from PIL import Image
-import sys
 import os
+import argparse
 
 # ZX Spectrum palette (RGB values)
 # Normal brightness (0) and bright (1) versions
@@ -33,9 +34,14 @@ ZX_HEIGHT = 192
 ATTR_BLOCK_SIZE = 8  # Color attributes applied in 8x8 blocks
 
 
-def color_distance(c1, c2):
-    """Calculate squared Euclidean distance between two RGB colors."""
+def rgb_squared_distance(c1, c2):
+    """Squared Euclidean distance in RGB."""
     return (c1[0] - c2[0])**2 + (c1[1] - c2[1])**2 + (c1[2] - c2[2])**2
+
+
+def perceptual_distance(lab1, lab2):
+    """Wrapper to make swapping distance metrics easier."""
+    return delta_e_ciede2000(lab1, lab2)
 
 
 def delta_e_ciede2000(lab1, lab2):
@@ -171,17 +177,18 @@ ZX_PALETTE_LAB = [rgb_to_lab(c) for c in ZX_PALETTE]
 
 def find_nearest_zx_color(rgb):
     """Find the nearest ZX Spectrum color to the given RGB value."""
+    rgb_lab = rgb_to_lab(rgb)
     min_dist = float('inf')
     nearest_idx = 0
-    for idx, zx_color in enumerate(ZX_PALETTE):
-        dist = color_distance(rgb, zx_color)
+    for idx, zx_lab in enumerate(ZX_PALETTE_LAB):
+        dist = perceptual_distance(rgb_lab, zx_lab)
         if dist < min_dist:
             min_dist = dist
             nearest_idx = idx
     return nearest_idx
 
 
-def find_best_two_colors_for_block(pixels_in_block):
+def find_best_two_colors_for_block(block_rgbs, block_labs, distance_mode):
     """
     Find the best two ZX Spectrum colors for an 8x8 block.
     Both colors must be from the same brightness level.
@@ -199,13 +206,23 @@ def find_best_two_colors_for_block(pixels_in_block):
 
         # Try all pairs of colors in this brightness level
         for ink_idx in color_range:
+            ink_lab = ZX_PALETTE_LAB[ink_idx]
+            ink_rgb = ZX_PALETTE[ink_idx]
             for paper_idx in color_range:
+                paper_lab = ZX_PALETTE_LAB[paper_idx]
+                paper_rgb = ZX_PALETTE[paper_idx]
                 total_error = 0
-                for pixel in pixels_in_block:
-                    # For each pixel, pick whichever of ink/paper is closer
-                    dist_ink = color_distance(pixel, ZX_PALETTE[ink_idx])
-                    dist_paper = color_distance(pixel, ZX_PALETTE[paper_idx])
-                    total_error += min(dist_ink, dist_paper)
+                if distance_mode == 'cie':
+                    for lab in block_labs:
+                        # For each pixel, pick whichever of ink/paper is closer in Lab space
+                        dist_ink = perceptual_distance(lab, ink_lab)
+                        dist_paper = perceptual_distance(lab, paper_lab)
+                        total_error += min(dist_ink, dist_paper)
+                else:
+                    for rgb in block_rgbs:
+                        dist_ink = rgb_squared_distance(rgb, ink_rgb)
+                        dist_paper = rgb_squared_distance(rgb, paper_rgb)
+                        total_error += min(dist_ink, dist_paper)
 
                 if total_error < best_error:
                     best_error = total_error
@@ -216,8 +233,11 @@ def find_best_two_colors_for_block(pixels_in_block):
     return best_ink, best_paper, best_bright
 
 
-def convert_to_zx_spectrum(input_path, output_path):
-    """Convert an image to ZX Spectrum resolution and colors with attribute blocks."""
+def convert_to_zx_spectrum(input_path, output_path, distance_mode='cie'):
+    """
+    Convert an image to ZX Spectrum resolution and colors with attribute blocks.
+    distance_mode: 'cie' for CIEDE2000 in Lab, 'rgb' for raw RGB distance.
+    """
     img = Image.open(input_path)
     
     # Convert to RGB if necessary
@@ -234,30 +254,42 @@ def convert_to_zx_spectrum(input_path, output_path):
     for block_y in range(ZX_HEIGHT // ATTR_BLOCK_SIZE):
         for block_x in range(ZX_WIDTH // ATTR_BLOCK_SIZE):
             # Collect all pixels in this block
-            pixels_in_block = []
-            for py in range(ATTR_BLOCK_SIZE):
-                for px in range(ATTR_BLOCK_SIZE):
-                    x = block_x * ATTR_BLOCK_SIZE + px
-                    y = block_y * ATTR_BLOCK_SIZE + py
-                    pixels_in_block.append(img_resized.getpixel((x, y)))
-            
-            # Find best two colors for this block
-            ink_idx, paper_idx, _ = find_best_two_colors_for_block(pixels_in_block)
-            ink_color = ZX_PALETTE[ink_idx]
-            paper_color = ZX_PALETTE[paper_idx]
-
-            # Apply colors to block - each pixel gets whichever of ink/paper is closer
+            block_rgbs = []
+            block_labs = []
             for py in range(ATTR_BLOCK_SIZE):
                 for px in range(ATTR_BLOCK_SIZE):
                     x = block_x * ATTR_BLOCK_SIZE + px
                     y = block_y * ATTR_BLOCK_SIZE + py
                     pixel = img_resized.getpixel((x, y))
+                    block_rgbs.append(pixel)
+                    if distance_mode == 'cie':
+                        block_labs.append(rgb_to_lab(pixel))
 
-                    dist_ink = color_distance(pixel, ink_color)
-                    dist_paper = color_distance(pixel, paper_color)
+            # Find best two colors for this block
+            ink_idx, paper_idx, _ = find_best_two_colors_for_block(block_rgbs, block_labs, distance_mode)
+            ink_color = ZX_PALETTE[ink_idx]
+            paper_color = ZX_PALETTE[paper_idx]
+            ink_lab = ZX_PALETTE_LAB[ink_idx]
+            paper_lab = ZX_PALETTE_LAB[paper_idx]
+
+            # Apply colors to block - each pixel gets whichever of ink/paper is closer
+            idx = 0
+            for py in range(ATTR_BLOCK_SIZE):
+                for px in range(ATTR_BLOCK_SIZE):
+                    x = block_x * ATTR_BLOCK_SIZE + px
+                    y = block_y * ATTR_BLOCK_SIZE + py
+                    if distance_mode == 'cie':
+                        lab = block_labs[idx]
+                        dist_ink = perceptual_distance(lab, ink_lab)
+                        dist_paper = perceptual_distance(lab, paper_lab)
+                    else:
+                        rgb = block_rgbs[idx]
+                        dist_ink = rgb_squared_distance(rgb, ink_color)
+                        dist_paper = rgb_squared_distance(rgb, paper_color)
                     new_color = ink_color if dist_ink < dist_paper else paper_color
                     output.putpixel((x, y), new_color)
-    
+                    idx += 1
+
     output.save(output_path)
     print(f"Converted image saved to: {output_path}")
     print(f"Resolution: {ZX_WIDTH}x{ZX_HEIGHT}")
@@ -265,26 +297,40 @@ def convert_to_zx_spectrum(input_path, output_path):
 
 if __name__ == '__main__':
     import glob
-    
-    if len(sys.argv) >= 2:
-        # Single file mode
-        input_file = sys.argv[1]
-        if len(sys.argv) >= 3:
-            output_file = sys.argv[2]
+
+    parser = argparse.ArgumentParser(description="Convert images to ZX Spectrum palette.")
+    parser.add_argument("input", nargs="?", help="Input image file")
+    parser.add_argument("output", nargs="?", help="Output path (used only when mode is not 'both')")
+    parser.add_argument("--mode", choices=["cie", "rgb", "both"], default="both", help="Distance metric to use")
+    args = parser.parse_args()
+
+    def build_outputs(base_path, ext, mode, explicit_out=None):
+        if mode == "both":
+            base = os.path.splitext(explicit_out)[0] if explicit_out else base_path
+            return [
+                (f"{base}_zx_cie{ext}", "cie"),
+                (f"{base}_zx_rgb{ext}", "rgb"),
+            ]
         else:
-            base, ext = os.path.splitext(input_file)
-            output_file = f"{base}_zx{ext}"
-        convert_to_zx_spectrum(input_file, output_file)
+            target = explicit_out if explicit_out else f"{base_path}_zx_{mode}{ext}"
+            return [(target, mode)]
+
+    if args.input:
+        input_file = args.input
+        base, ext = os.path.splitext(args.output if args.output else input_file)
+        outputs = build_outputs(base, ext, args.mode, explicit_out=args.output)
+        for output_file, mode in outputs:
+            convert_to_zx_spectrum(input_file, output_file, distance_mode=mode)
     else:
-        # Batch mode - convert all jpg and webp files without _zx
+        # Batch mode - convert all jpg and webp files without existing _zx outputs
         script_dir = os.path.dirname(os.path.abspath(__file__))
         patterns = ['*.jpg', '*.jpeg', '*.webp']
-        
         for pattern in patterns:
             for input_file in glob.glob(os.path.join(script_dir, pattern)):
                 base, ext = os.path.splitext(input_file)
-                if base.endswith('_zx'):
+                if base.endswith('_zx') or base.endswith('_zx_cie') or base.endswith('_zx_rgb'):
                     continue
-                output_file = f"{base}_zx{ext}"
                 print(f"Converting: {os.path.basename(input_file)}")
-                convert_to_zx_spectrum(input_file, output_file)
+                outputs = build_outputs(base, ext, args.mode)
+                for output_file, mode in outputs:
+                    convert_to_zx_spectrum(input_file, output_file, distance_mode=mode)

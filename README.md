@@ -1,39 +1,45 @@
 ZX Graphics Converter
 =====================
 
-Small tool to downscale images to ZX Spectrum resolution (256x192) and palette. Each 8x8 attribute block is limited to two colors of the same brightness level, matching Spectrum hardware.
+Converts images to ZX Spectrum resolution (256×192) and palette. Each 8×8 attribute block is limited to two colors from the same brightness level (normal or bright), matching Spectrum hardware constraints.
 
-Features
-- Palette-accurate ZX rendering with attribute blocks.
-- Two distance modes: perceptual (Lab/ΔE2000) and simple RGB.
-- Default dual-output mode to compare both metrics.
-- Batch conversion for common image types (jpg/jpeg/webp).
+Algorithm
+---------
+1. Resize image to 256×192 using Lanczos downsampling.
+2. Split into 8×8 blocks (32×24 = 768 blocks total).
+3. For each block, brute-force search all color pairs within each brightness group (normal 0-7, bright 8-15) to find the pair that minimizes total error across all 64 pixels.
+4. Assign each pixel to whichever of the two chosen colors is closer.
+
+This guarantees the optimal 2-color approximation for each block under the selected distance metric.
+
+Distance Modes
+--------------
+- `cie`: Linear CIEDE2000 (ΔE00) in Lab color space. Perceptually uniform.
+- `rgb`: Squared Euclidean distance in RGB. Faster.
 
 Requirements
+------------
 - Python 3.10+
-- Pillow (`pip install pillow`)
+- Pillow, NumPy (`pip install pillow numpy`)
 
 Usage
+-----
 ```
-python zx_convert.py <input_image> [output_image] [--mode cie|rgb|both]
+python zx_convert.py [input_image] [output_image] [--mode cie|rgb|both]
 ```
-- `--mode cie` (default for single output) uses Lab + ΔE2000.
-- `--mode rgb` uses squared Euclidean distance in RGB.
-- `--mode both` (default when no output is specified) writes two files: `<base>_zx_cie` and `<base>_zx_rgb`.
-- If `output_image` is omitted, names are derived from the input (with mode suffixes).
 
-Batch conversion
+Examples:
 ```
-python zx_convert.py --mode both
+python zx_convert.py photo.jpg                    # outputs photo_zx_cie.jpg and photo_zx_rgb.jpg
+python zx_convert.py photo.jpg --mode rgb         # outputs photo_zx_rgb.jpg only
+python zx_convert.py photo.jpg out.jpg --mode rgb # outputs out.jpg
+python zx_convert.py                              # batch mode: all jpg/jpeg/webp in script directory
 ```
-With no positional args, all `*.jpg`, `*.jpeg`, and `*.webp` files in the script directory are processed, skipping any that already have `_zx`, `_zx_cie`, or `_zx_rgb` in the name.
 
-How it works
-- Images are resized to 256x192 (Lanczos).
-- For each 8x8 block, the tool chooses the best two palette colors within the same brightness (normal or bright) using the selected distance metric.
-- Each pixel in the block is assigned to whichever of the two chosen colors is closer under that metric.
+Batch mode skips files with `_zx`, `_zx_cie`, or `_zx_rgb` suffixes.
 
 Notes
-- ΔE2000 generally preserves perceived hue/brightness relationships better than RGB distance; use RGB if you want to see the naïve comparison.
-- Outputs are standard image files using the input extension (jpg/webp, etc.) with `_zx_*` suffixes.
-- RGB looks better; the algorithm should be more global.
+-----
+- RGB mode often produces visually better results because squared distance penalizes large errors more heavily.
+- Output uses the input file's extension (jpg, webp, etc.) with `_zx_*` suffix.
+- The 15-color ZX palette has 8 normal and 8 bright colors (black appears in both).

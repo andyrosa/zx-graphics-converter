@@ -1,11 +1,12 @@
 """
-Convert an image to ZX Spectrum resolution (256x192) and color palette (8 colors with 2 brightness levels, minus black which is the same at both) at 32 x 24.
-Supports either perceptual (CIEDE2000 in Lab) or simple RGB distance per image.
+Convert an image to ZX Spectrum resolution and color palette 
 """
 
 from PIL import Image
+import numpy as np
 import os
 import argparse
+
 
 # ZX Spectrum palette (RGB values)
 # Normal brightness (0) and bright (1) versions
@@ -34,100 +35,11 @@ ZX_HEIGHT = 192
 ATTR_BLOCK_SIZE = 8  # Color attributes applied in 8x8 blocks
 
 
-def rgb_squared_distance(c1, c2):
-    """Squared Euclidean distance in RGB."""
-    return (c1[0] - c2[0])**2 + (c1[1] - c2[1])**2 + (c1[2] - c2[2])**2
-
-
-def perceptual_distance(lab1, lab2):
-    """Wrapper to make swapping distance metrics easier."""
-    return delta_e_ciede2000(lab1, lab2)
-
-
-def delta_e_ciede2000(lab1, lab2):
-    """Compute CIEDE2000 color difference between two Lab colors.
-
-    Implementation based on the formula from the CIEDE2000 standard (approximate).
-    Expects lab tuples (L, a, b).
-    Returns a non-negative float; lower values mean more similar.
-    """
-    import math
-
-    L1, a1, b1 = lab1
-    L2, a2, b2 = lab2
-
-    # Step 1: Compute C' and h'
-    C1 = math.sqrt(a1 * a1 + b1 * b1)
-    C2 = math.sqrt(a2 * a2 + b2 * b2)
-    C_bar = (C1 + C2) / 2.0
-
-    G = 0.5 * (1 - math.sqrt((C_bar ** 7) / (C_bar ** 7 + 25 ** 7))) if C_bar != 0 else 0
-    a1p = (1 + G) * a1
-    a2p = (1 + G) * a2
-
-    C1p = math.sqrt(a1p * a1p + b1 * b1)
-    C2p = math.sqrt(a2p * a2p + b2 * b2)
-
-    def _hp(a_prime, b):
-        if a_prime == 0 and b == 0:
-            return 0.0
-        angle = math.degrees(math.atan2(b, a_prime))
-        return angle + 360 if angle < 0 else angle
-
-    h1p = _hp(a1p, b1)
-    h2p = _hp(a2p, b2)
-
-    # Step 2: Delta L', Delta C', Delta H'
-    dLp = L2 - L1
-    dCp = C2p - C1p
-
-    dhp = h2p - h1p
-    if C1p * C2p == 0:
-        dhp = 0.0
-    else:
-        if dhp > 180:
-            dhp -= 360
-        elif dhp < -180:
-            dhp += 360
-
-    dHp = 2 * math.sqrt(C1p * C2p) * math.sin(math.radians(dhp / 2.0))
-
-    # Step 3: Calculate weighting functions
-    Lp_bar = (L1 + L2) / 2.0
-    Cp_bar = (C1p + C2p) / 2.0
-
-    # Compute h_bar
-    if C1p * C2p == 0:
-        hp_bar = h1p + h2p
-    else:
-        hp_bar = h1p + h2p
-        if abs(h1p - h2p) > 180:
-            hp_bar += 360 if (h1p + h2p) < 360 else -360
-        hp_bar /= 2.0
-
-    T = 1 - 0.17 * math.cos(math.radians(hp_bar - 30)) + 0.24 * math.cos(math.radians(2 * hp_bar)) + 0.32 * math.cos(math.radians(3 * hp_bar + 6)) - 0.20 * math.cos(math.radians(4 * hp_bar - 63))
-
-    delta_ro = 30 * math.exp(-((hp_bar - 275) / 25) ** 2)
-    Rc = 2 * math.sqrt((Cp_bar ** 7) / (Cp_bar ** 7 + 25 ** 7))
-
-    Sl = 1 + ((0.015 * ((Lp_bar - 50) ** 2)) / math.sqrt(20 + ((Lp_bar - 50) ** 2)))
-    Sc = 1 + 0.045 * Cp_bar
-    Sh = 1 + 0.015 * Cp_bar * T
-
-    Rt = -math.sin(math.radians(2 * delta_ro)) * Rc
-
-    # Step 4: Combine
-    kL = kC = kH = 1.0
-    dE = math.sqrt((dLp / (kL * Sl)) ** 2 + (dCp / (kC * Sc)) ** 2 + (dHp / (kH * Sh)) ** 2 + Rt * (dCp / (kC * Sc)) * (dHp / (kH * Sh)))
-
-    return dE
-
-
-def _rgb_to_linear(c):
+def _rgb_to_linear(channel_value):
     # convert sRGB channel (0..1) to linear RGB
-    if c <= 0.04045:
-        return c / 12.92
-    return ((c + 0.055) / 1.055) ** 2.4
+    if channel_value <= 0.04045:
+        return channel_value / 12.92
+    return ((channel_value + 0.055) / 1.055) ** 2.4
 
 
 def rgb_to_lab(rgb):
@@ -136,7 +48,7 @@ def rgb_to_lab(rgb):
     Returns (L, a, b) where L in 0..100 (approximately), a/b roughly -128..127.
     """
     # sRGB [0,255] -> [0,1]
-    r, g, b = [v / 255.0 for v in rgb]
+    r, g, b = [value / 255.0 for value in rgb]
 
     # Convert to linear RGB
     r_lin = _rgb_to_linear(r)
@@ -172,136 +84,253 @@ def rgb_to_lab(rgb):
 
 
 # Precompute Lab representations of the ZX palette for speed
-ZX_PALETTE_LAB = [rgb_to_lab(c) for c in ZX_PALETTE]
+ZX_PALETTE_LAB = [rgb_to_lab(color) for color in ZX_PALETTE]
+
+# NumPy arrays for vectorized operations
+ZX_PALETTE_RGB_ARRAY = np.array(ZX_PALETTE, dtype=np.float32)
+ZX_PALETTE_LAB_ARRAY = np.array(ZX_PALETTE_LAB, dtype=np.float32)
 
 
-def find_nearest_zx_color(rgb):
-    """Find the nearest ZX Spectrum color to the given RGB value."""
-    rgb_lab = rgb_to_lab(rgb)
-    min_dist = float('inf')
-    nearest_idx = 0
-    for idx, zx_lab in enumerate(ZX_PALETTE_LAB):
-        dist = perceptual_distance(rgb_lab, zx_lab)
-        if dist < min_dist:
-            min_dist = dist
-            nearest_idx = idx
-    return nearest_idx
 
 
-def find_best_two_colors_for_block(block_rgbs, block_labs, distance_mode):
+def delta_e_ciede2000_block(lab_block, reference_lab_color):
     """
-    Find the best two ZX Spectrum colors for an 8x8 block.
-    Both colors must be from the same brightness level.
-    Returns (ink_color_idx, paper_color_idx, is_bright)
+    Vectorized CIEDE2000 between many Lab pixels and a single Lab palette color.
+
+    lab_block: numpy array (num_pixels, 3)
+    reference_lab_color: iterable of length 3 (L, a, b)
+    returns: numpy array (num_pixels,) of ΔE00 distances
     """
-    best_error = float('inf')
-    best_ink = 0
-    best_paper = 0
-    best_bright = False
+    L1 = lab_block[:, 0]
+    a1 = lab_block[:, 1]
+    b1 = lab_block[:, 2]
 
-    # Try normal brightness (indices 0-7) and bright (indices 8-15)
-    for bright in [False, True]:
-        offset = 8 if bright else 0
-        color_range = range(offset, offset + 8)
+    L2 = float(reference_lab_color[0])
+    a2 = float(reference_lab_color[1])
+    b2 = float(reference_lab_color[2])
 
-        # Try all pairs of colors in this brightness level
-        for ink_idx in color_range:
-            ink_lab = ZX_PALETTE_LAB[ink_idx]
-            ink_rgb = ZX_PALETTE[ink_idx]
-            for paper_idx in color_range:
-                paper_lab = ZX_PALETTE_LAB[paper_idx]
-                paper_rgb = ZX_PALETTE[paper_idx]
-                total_error = 0
-                if distance_mode == 'cie':
-                    for lab in block_labs:
-                        # For each pixel, pick whichever of ink/paper is closer in Lab space
-                        dist_ink = perceptual_distance(lab, ink_lab)
-                        dist_paper = perceptual_distance(lab, paper_lab)
-                        total_error += min(dist_ink, dist_paper)
-                else:
-                    for rgb in block_rgbs:
-                        dist_ink = rgb_squared_distance(rgb, ink_rgb)
-                        dist_paper = rgb_squared_distance(rgb, paper_rgb)
-                        total_error += min(dist_ink, dist_paper)
+    # Step 1: chroma
+    C1 = np.sqrt(a1 * a1 + b1 * b1)
+    C2 = np.sqrt(a2 * a2 + b2 * b2)
+    C_bar = (C1 + C2) / 2.0
+
+    C_bar_pow7 = C_bar ** 7
+    G = 0.5 * (1.0 - np.sqrt(C_bar_pow7 / (C_bar_pow7 + 25.0 ** 7)))
+
+    a1_prime = (1.0 + G) * a1
+    a2_prime = (1.0 + G) * a2
+
+    C1_prime = np.sqrt(a1_prime * a1_prime + b1 * b1)
+    C2_prime = np.sqrt(a2_prime * a2_prime + b2 * b2)
+
+    # Step 2: hue angles
+    h1_prime = np.degrees(np.arctan2(b1, a1_prime))
+    h1_prime = np.where(h1_prime < 0.0, h1_prime + 360.0, h1_prime)
+
+    h2_prime = np.degrees(np.arctan2(b2, a2_prime))
+    h2_prime = np.where(h2_prime < 0.0, h2_prime + 360.0, h2_prime)
+
+    delta_L_prime = L2 - L1
+    delta_C_prime = C2_prime - C1_prime
+
+    delta_h_prime = h2_prime - h1_prime
+    zero_chroma_mask = (C1_prime * C2_prime) == 0.0
+    delta_h_prime = np.where(zero_chroma_mask, 0.0, delta_h_prime)
+    delta_h_prime = np.where(delta_h_prime > 180.0, delta_h_prime - 360.0, delta_h_prime)
+    delta_h_prime = np.where(delta_h_prime < -180.0, delta_h_prime + 360.0, delta_h_prime)
+
+    delta_H_prime = 2.0 * np.sqrt(C1_prime * C2_prime) * np.sin(
+        np.radians(delta_h_prime / 2.0)
+    )
+
+    # Step 3: means and weighting
+    L_prime_bar = (L1 + L2) / 2.0
+    C_prime_bar = (C1_prime + C2_prime) / 2.0
+
+    hue_sum = h1_prime + h2_prime
+    hue_difference = np.abs(h1_prime - h2_prime)
+    non_zero_chroma_mask = ~zero_chroma_mask
+
+    h_prime_bar = hue_sum.copy()
+    adjust_mask = non_zero_chroma_mask & (hue_difference > 180.0)
+
+    h_prime_bar = np.where(
+        adjust_mask & (hue_sum < 360.0),
+        h_prime_bar + 360.0,
+        h_prime_bar,
+    )
+    h_prime_bar = np.where(
+        adjust_mask & (hue_sum >= 360.0),
+        h_prime_bar - 360.0,
+        h_prime_bar,
+    )
+    h_prime_bar = np.where(
+        non_zero_chroma_mask,
+        h_prime_bar / 2.0,
+        h_prime_bar,
+    )
+
+    T = (
+        1.0
+        - 0.17 * np.cos(np.radians(h_prime_bar - 30.0))
+        + 0.24 * np.cos(np.radians(2.0 * h_prime_bar))
+        + 0.32 * np.cos(np.radians(3.0 * h_prime_bar + 6.0))
+        - 0.20 * np.cos(np.radians(4.0 * h_prime_bar - 63.0))
+    )
+
+    delta_theta = 30.0 * np.exp(-((h_prime_bar - 275.0) / 25.0) ** 2)
+    R_C = 2.0 * np.sqrt((C_prime_bar ** 7) / (C_prime_bar ** 7 + 25.0 ** 7))
+
+    S_L = 1.0 + (0.015 * (L_prime_bar - 50.0) ** 2) / np.sqrt(
+        20.0 + (L_prime_bar - 50.0) ** 2
+    )
+    S_C = 1.0 + 0.045 * C_prime_bar
+    S_H = 1.0 + 0.015 * C_prime_bar * T
+
+    R_T = -np.sin(2.0 * np.radians(delta_theta)) * R_C
+
+    delta_E = np.sqrt(
+        (delta_L_prime / S_L) ** 2
+        + (delta_C_prime / S_C) ** 2
+        + (delta_H_prime / S_H) ** 2
+        + R_T * (delta_C_prime / S_C) * (delta_H_prime / S_H)
+    )
+
+    return delta_E
+
+
+def get_block_distances(block_pixels, mode):
+    """
+    Calculate distances from every pixel in the block to every palette color.
+    Returns: numpy array (num_pixels, 16)
+    """
+    num_pixels = block_pixels.shape[0]
+
+    if mode == "cie":
+        distances = np.zeros((num_pixels, 16), dtype=np.float32)
+        # Convert block to Lab
+        lab_block = np.empty((num_pixels, 3), dtype=np.float32)
+        for i in range(num_pixels):
+            lab_block[i] = rgb_to_lab(tuple(block_pixels[i]))
+
+        for i in range(16):
+            distances[:, i] = delta_e_ciede2000_block(lab_block, ZX_PALETTE_LAB_ARRAY[i])
+        return distances
+    else:
+        # RGB: Squared Euclidean distance
+        # block: (N, 3), palette: (16, 3)
+        # (N, 1, 3) - (1, 16, 3) -> (N, 16, 3)
+        diff = (
+            block_pixels[:, np.newaxis, :].astype(np.float32)
+            - ZX_PALETTE_RGB_ARRAY[np.newaxis, :, :]
+        )
+        return np.sum(diff * diff, axis=2)
+
+
+def process_8x8_block(block_pixels, mode):
+    """
+    Find best 2 colors for the block and return the quantized pixels.
+    """
+    distances = get_block_distances(block_pixels, mode)
+
+    best_error = np.inf
+    best_c1, best_c2 = 0, 0
+
+    # Iterate over the two brightness groups (0-7 and 8-15)
+    for group_start in (0, 8):
+        # Extract distances for this group: (64, 8)
+        group_dists = distances[:, group_start : group_start + 8]
+
+        # Brute force all pairs in this group
+        for i in range(8):
+            d1 = group_dists[:, i]
+            # Optimization: j starts at i (colors can be same)
+            for j in range(i, 8):
+                d2 = group_dists[:, j]
+                # Error is sum of min distance for each pixel
+                total_error = np.sum(np.minimum(d1, d2))
 
                 if total_error < best_error:
                     best_error = total_error
-                    best_ink = ink_idx
-                    best_paper = paper_idx
-                    best_bright = bright
-    
-    return best_ink, best_paper, best_bright
+                    best_c1 = group_start + i
+                    best_c2 = group_start + j
+
+    # Reconstruct the block using the best two colors
+    mask = distances[:, best_c1] <= distances[:, best_c2]
+
+    c1 = ZX_PALETTE_RGB_ARRAY[best_c1]
+    c2 = ZX_PALETTE_RGB_ARRAY[best_c2]
+
+    # (64, 3)
+    result = np.where(mask[:, np.newaxis], c1, c2)
+    return result.astype(np.uint8)
 
 
-def convert_to_zx_spectrum(input_path, output_path, distance_mode='cie'):
+def convert_to_zx_spectrum(input_path, output_path, distance_mode="cie"):
     """
     Convert an image to ZX Spectrum resolution and colors with attribute blocks.
-    distance_mode: 'cie' for CIEDE2000 in Lab, 'rgb' for raw RGB distance.
+
+    Uses NumPy-accelerated brute-force search over palette colors, per brightness group.
+    For each 8x8 block, finds the best 2-color approximation by minimizing
+    total error across all 64 pixels.
+
+    distance_mode: 'cie' for linear CIEDE2000, 'rgb' for squared RGB.
     """
     img = Image.open(input_path)
-    
+
     # Convert to RGB if necessary
-    if img.mode != 'RGB':
-        img = img.convert('RGB')
-    
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+
     # Resize to ZX Spectrum resolution
     img_resized = img.resize((ZX_WIDTH, ZX_HEIGHT), Image.Resampling.LANCZOS)
-    
-    # Create output image
-    output = Image.new('RGB', (ZX_WIDTH, ZX_HEIGHT))
-    
+
+    # Convert to numpy array for fast processing
+    img_array = np.array(img_resized, dtype=np.uint8)
+    output_array = np.zeros_like(img_array)
+
     # Process each 8x8 attribute block
-    for block_y in range(ZX_HEIGHT // ATTR_BLOCK_SIZE):
-        for block_x in range(ZX_WIDTH // ATTR_BLOCK_SIZE):
-            # Collect all pixels in this block
-            block_rgbs = []
-            block_labs = []
-            for py in range(ATTR_BLOCK_SIZE):
-                for px in range(ATTR_BLOCK_SIZE):
-                    x = block_x * ATTR_BLOCK_SIZE + px
-                    y = block_y * ATTR_BLOCK_SIZE + py
-                    pixel = img_resized.getpixel((x, y))
-                    block_rgbs.append(pixel)
-                    if distance_mode == 'cie':
-                        block_labs.append(rgb_to_lab(pixel))
+    blocks_x = ZX_WIDTH // ATTR_BLOCK_SIZE
+    blocks_y = ZX_HEIGHT // ATTR_BLOCK_SIZE
 
-            # Find best two colors for this block
-            ink_idx, paper_idx, _ = find_best_two_colors_for_block(block_rgbs, block_labs, distance_mode)
-            ink_color = ZX_PALETTE[ink_idx]
-            paper_color = ZX_PALETTE[paper_idx]
-            ink_lab = ZX_PALETTE_LAB[ink_idx]
-            paper_lab = ZX_PALETTE_LAB[paper_idx]
+    for block_y in range(blocks_y):
+        for block_x in range(blocks_x):
+            # Extract block pixels
+            y_start = block_y * ATTR_BLOCK_SIZE
+            y_end = y_start + ATTR_BLOCK_SIZE
+            x_start = block_x * ATTR_BLOCK_SIZE
+            x_end = x_start + ATTR_BLOCK_SIZE
 
-            # Apply colors to block - each pixel gets whichever of ink/paper is closer
-            idx = 0
-            for py in range(ATTR_BLOCK_SIZE):
-                for px in range(ATTR_BLOCK_SIZE):
-                    x = block_x * ATTR_BLOCK_SIZE + px
-                    y = block_y * ATTR_BLOCK_SIZE + py
-                    if distance_mode == 'cie':
-                        lab = block_labs[idx]
-                        dist_ink = perceptual_distance(lab, ink_lab)
-                        dist_paper = perceptual_distance(lab, paper_lab)
-                    else:
-                        rgb = block_rgbs[idx]
-                        dist_ink = rgb_squared_distance(rgb, ink_color)
-                        dist_paper = rgb_squared_distance(rgb, paper_color)
-                    new_color = ink_color if dist_ink < dist_paper else paper_color
-                    output.putpixel((x, y), new_color)
-                    idx += 1
+            block = img_array[y_start:y_end, x_start:x_end]
+            block_pixels = block.reshape(64, 3)
 
-    output.save(output_path)
-    print(f"Converted image saved to: {output_path}")
-    print(f"Resolution: {ZX_WIDTH}x{ZX_HEIGHT}")
-    
+            # Process block
+            result_pixels = process_8x8_block(block_pixels, distance_mode)
 
-if __name__ == '__main__':
+            # Write back to output
+            output_array[y_start:y_end, x_start:x_end] = result_pixels.reshape(8, 8, 3)
+
+    # Save output
+    output_img = Image.fromarray(output_array)
+    output_img.save(output_path)
+    file_size = os.path.getsize(output_path)
+    print(f"Saved: {output_path} ({file_size:,} bytes)")
+
+
+if __name__ == "__main__":
     import glob
 
     parser = argparse.ArgumentParser(description="Convert images to ZX Spectrum palette.")
     parser.add_argument("input", nargs="?", help="Input image file")
-    parser.add_argument("output", nargs="?", help="Output path (used only when mode is not 'both')")
-    parser.add_argument("--mode", choices=["cie", "rgb", "both"], default="both", help="Distance metric to use")
+    parser.add_argument(
+        "output", nargs="?", help="Output path (used only when mode is not 'both')"
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["cie", "rgb", "both"],
+        default="both",
+        help="Distance metric to use",
+    )
     args = parser.parse_args()
 
     def build_outputs(base_path, ext, mode, explicit_out=None):
@@ -312,7 +341,11 @@ if __name__ == '__main__':
                 (f"{base}_zx_rgb{ext}", "rgb"),
             ]
         else:
-            target = explicit_out if explicit_out else f"{base_path}_zx_{mode}{ext}"
+            target = (
+                explicit_out
+                if explicit_out
+                else f"{base_path}_zx_{mode}{ext}"
+            )
             return [(target, mode)]
 
     if args.input:
@@ -324,11 +357,15 @@ if __name__ == '__main__':
     else:
         # Batch mode - convert all jpg and webp files without existing _zx outputs
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        patterns = ['*.jpg', '*.jpeg', '*.webp']
+        patterns = ["*.jpg", "*.jpeg", "*.webp"]
         for pattern in patterns:
             for input_file in glob.glob(os.path.join(script_dir, pattern)):
                 base, ext = os.path.splitext(input_file)
-                if base.endswith('_zx') or base.endswith('_zx_cie') or base.endswith('_zx_rgb'):
+                if (
+                    base.endswith("_zx")
+                    or base.endswith("_zx_cie")
+                    or base.endswith("_zx_rgb")
+                ):
                     continue
                 print(f"Converting: {os.path.basename(input_file)}")
                 outputs = build_outputs(base, ext, args.mode)
